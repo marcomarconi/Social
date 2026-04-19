@@ -1,0 +1,42 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+library(quantmod)
+library(tidyverse)
+library(ggthemes)
+
+
+Bund <- read_csv("~/Downloads/ggm26_daily-nearby_historical-data-03-28-2026.csv", show_col_types = F) %>% mutate(date=as.Date(Time)); 
+Schatz <- read_csv("~/Downloads/hfm26_daily-nearby_historical-data-03-29-2026.csv", show_col_types = F) %>% mutate(date=as.Date(Time)); 
+NG <- read_csv("~/Downloads/ngz26_daily-nearby_historical-data-03-29-2026.csv", show_col_types = F) %>% mutate(date=as.Date(Time)); 
+CL <- read_csv("~/Downloads/clk26_daily-nearby_historical-data-03-29-2026.csv", show_col_types = F) %>% mutate(date=as.Date(Time)); 
+ES <- read_csv("~/Downloads/esm26_daily-nearby_historical-data-03-29-2026.csv", show_col_types = F) %>% mutate(date=as.Date(Time)); 
+```
+```{r}
+Bund <- Bund %>% arrange(Time) %>% mutate(wday=factor(wday(date)), ret=c(0, diff(log(Latest)))*100) 
+Schatz <- Schatz %>% arrange(Time)%>% mutate(wday=factor(wday(date)), ret=c(0, diff(log(Latest)))*100) 
+NG <- NG %>% arrange(Time) %>% mutate(wday=factor(wday(date)), ret=c(0, diff(log(Latest)))*100) 
+CL <- CL %>% arrange(Time) %>% mutate(wday=factor(wday(date)), ret=c(0, diff(log(Latest)))*100) 
+ES <- ES %>% arrange(Time) %>% mutate(wday=factor(wday(date)), ret=c(0, diff(log(Latest)))*100) 
+Bund %>% group_by(wday) %>% reframe(Mean = mean(ret, na.rm=T), Stderr = sd(ret, na.rm=T)/sqrt(n()), Std = sd(ret, na.rm=T), Cost = 0.028/125*100, SR=Mean/Std*16)
+Schatz %>% group_by(wday) %>% reframe(Mean = mean(ret, na.rm=T), Stderr = sd(ret, na.rm=T)/sqrt(n()), Std = sd(ret, na.rm=T), Cost = 0.013/125*100, SR=Mean/Std*16)
+NG %>% group_by(wday) %>% reframe(Mean = mean(ret, na.rm=T), Stderr = sd(ret, na.rm=T)/sqrt(n()), Std = sd(ret, na.rm=T), Cost = 0.013/125*100, SR=Mean/Std*16)
+ES %>% group_by(wday) %>% reframe(Mean = mean(ret, na.rm=T), Stderr = sd(ret, na.rm=T)/sqrt(n()), Std = sd(ret, na.rm=T), Cost = 0.6/6000*100, SR=Mean/Std*16)
+
+```
+
+```{r}
+Bund %>% group_by(wday) %>% mutate(eq=cumsum(replace_na(ret, 0))) %>% ggplot(aes(date, eq, color=wday, group=wday)) + geom_line() + scale_color_colorblind()
+Schatz %>% group_by(wday) %>% mutate(eq=cumsum(replace_na(ret, 0))) %>% ggplot(aes(date, eq, color=wday, group=wday)) + geom_line() + scale_color_colorblind()
+NG %>% group_by(wday) %>% mutate(eq=cumsum(replace_na(ret, 0))) %>% ggplot(aes(date, eq, color=wday, group=wday)) + geom_line() + scale_color_colorblind()
+CL %>% group_by(wday) %>% mutate(eq=cumsum(replace_na(ret, 0))) %>% ggplot(aes(date, eq, color=wday, group=wday)) + geom_line() + scale_color_colorblind()
+ES %>% group_by(wday) %>% mutate(eq=cumsum(replace_na(ret, 0))) %>% ggplot(aes(date, eq, color=wday, group=wday)) + geom_line() + scale_color_colorblind()
+```
+

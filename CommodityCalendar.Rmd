@@ -1,0 +1,54 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+library(tidyverse)
+library(quantmod)
+library(reshape2)
+library(tsibble)
+library(data.table)
+library(ggthemes)
+library(lubridate)
+library(TTR)
+source("/home/marco/trading/Systems//Common/Common.R")
+Sys.setlocale("LC_TIME", "en_US.UTF-8")
+theme_set(theme_bw(base_size = 32))
+
+```
+
+```{r}
+setwd("/home/marco/trading/Social/")
+dir.create("CommodityCalendar") 
+BackAdj <- read_rds("/home/marco/trading/HistoricalData/Barchart/BackAdj.RDS")
+
+```
+
+
+
+```{r}
+setwd("CommodityCalendar")
+res <- list()
+for(symbol in names(BackAdj)){
+    print(symbol)
+    df <- BackAdj[[symbol]] %>% filter(year(Date) > 2010)
+    df$Volatility <- calculate_volatility(df$Return)
+    df$Return <- df$Return / df$Volatility * sqrt(252) # Seasonality adjusted, comment it if unwanted
+    r <- sqrt(nrow(df)/12)*3
+    a <- group_by(df, YearMonth=yearmonth(Date)) %>% reframe(YearMonth=first(YearMonth), PnL=sum(replace_na(Return,0))) %>% group_by(Month=month(YearMonth)) %>%  mutate(Eq=cumsum(PnL), Symbol=symbol)
+    #p <- a %>% ggplot(aes(YearMonth, Eq, color=Month, group=Month)) + geom_line(size=2, alpha=0.5) +  geom_text(aes(label = Month)) + geom_hline(yintercept = c(-r,r), linetype="dashed") + scale_color_gradient(low = "red", high = "blue") + ylab(symbol)
+    #ggsave(filename = paste0(symbol, "_yearly_backtest.png"), p, width=12, height=9,dpi=75)
+    res[[symbol]] <- a#df %>% group_by(Month=month(Date), Symbol) %>% reframe(SR = mean(Return, na.rm=T) / sd(Return, na.rm=T) *sqrt(252))
+  }
+```
+
+```{r}
+final <- do.call(rbind, res) %>% group_by(Symbol, Month) %>% slice_tail(n=1)
+
+```
+

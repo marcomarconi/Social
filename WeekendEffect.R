@@ -1,0 +1,298 @@
+
+{
+    library(derivmkts)
+    library(tidyverse)
+    library(zoo)
+    library(TTR)
+    library(data.table)
+    library(lubridate)
+    library(Rfast)
+    library(tsibble)
+    library(ggthemes)
+    library(patchwork)
+    library(moments)
+    library(arrow)
+    source("/home/marco/trading/Systems/Common/RiskManagement.R")
+    source("/home/marco/trading/Systems/Common/Common.R")
+    theme_set(theme_bw(base_size = 24))
+    Sys.setlocale("LC_TIME", "en_US.UTF-8")
+    
+}
+
+# Load the strike data
+{
+    dir <- "/home/marco/trading/HistoricalData/ORATS/API/strikes/"
+    tickers <- c("SPY", "QQQ", "IWM", "GLD", "SLV", "TLT")
+    
+    # function for loading an ORATS core data file and returning a subset of columns
+    quiet_read_csv <- purrr::quietly((.f = read_csv))
+    quiet_fread <- purrr::quietly((.f = fread))
+    
+    load_orats_day <- function(filename, dir, cols_to_extract) {
+        print(filename)
+        # quiet_read_csv(glue::glue("/media/marco/Elements/ORATS/cores/{filename}")) #%>%
+        quiet_fread(glue::glue(paste0(dir, {filename}))) %>%
+            purrr::pluck("result")  %>%  
+            dplyr::select(all_of(cols_to_extract)) 
+    }
+    
+    cols_to_extract <- c(
+        "ticker",
+        "tradeDate",
+        "expirDate",
+        "dte",
+        "strike",
+        "spotPrice",     # or stockPrice
+        "callValue",
+        "putValue",
+        "callVolume",    # optional (tie-break)
+        "putVolume"      # optional (tie-break)
+    )
+    
+    
+    # Loads all ORATS core files, selecting interesting columns
+    ORATS_strikes <- list()
+    for(ticker in tickers) {
+        ticker_dir <- paste0(dir, ticker, "/")
+        files <- list.files(ticker_dir, "orats_.*_202[1-9].*gz")
+        ORATS_strikes[[ticker]] <- files %>% purrr::map_df(.f = load_orats_day, ticker_dir, cols_to_extract) %>% mutate(ticker = ticker)
+    }
+    ORATS_strikes <- do.call(rbind, ORATS_strikes)
+
+    
+}
+
+
+# Calculate straddle selling over Weekend
+{
+    library(dplyr)
+    library(lubridate)
+    
+    df <- ORATS_strikes %>%
+        mutate(
+            tradeDate = as.Date(tradeDate),
+            expirDate = as.Date(expirDate),
+            weekday = lubridate::wday(tradeDate, label = TRUE, week_start = 1)
+        )
+    
+    df <- df %>%
+        arrange(ticker, expirDate, strike, tradeDate) %>%
+        group_by(ticker, expirDate, strike) %>%
+        mutate(
+            straddle = callValue + putValue,
+            call = callValue,
+            put = putValue,
+            next_straddle = lead(straddle),
+            next_call = lead(call),
+            next_put = lead(put),
+            next_tradeDate = lead(tradeDate)
+        ) %>%
+        ungroup()
+    
+    df_fri <- df %>%
+        filter(weekday == "Fri")
+    
+    atm_fri <- df_fri %>%
+        mutate(
+            distance = abs(strike - spotPrice),
+            liquidity = callVolume + putVolume
+        ) %>%
+        group_by(ticker, tradeDate, expirDate) %>%
+        arrange(distance, desc(liquidity), .by_group = TRUE) %>%
+        slice(1) %>%
+        ungroup()
+    
+    atm_fri <- atm_fri %>%
+        mutate(
+            dte = as.numeric(expirDate - tradeDate)
+        )
+    
+    mon_legs <- atm_fri %>%
+        filter(dte == 3) %>%
+        rename(
+            mon_expir = expirDate,
+            mon_straddle = straddle,
+            mon_call = call,
+            mon_put = put,
+            mon_next = next_straddle,
+            mon_next_call = next_call,
+            mon_next_put = next_put
+        )
+    
+    fri_legs <- atm_fri %>%
+        filter(dte == 7) %>%
+        dplyr::select(ticker, tradeDate, strike, expirDate, straddle, next_straddle, call, next_call, put, next_put) %>%
+        rename(
+            fri_expir = expirDate,
+            fri_straddle = straddle,
+            fri_next = next_straddle,
+            fri_call = call,
+            fri_next_call = next_call,
+            fri_put = put,
+            fri_next_put = next_put
+        )
+    
+    month_legs <- atm_fri %>%
+        filter(dte >= 28 & dte <= 35) %>%
+        group_by(ticker, tradeDate, strike) %>%
+        slice_min(abs(dte - 30), n = 1) %>%  # closest to 1M
+        ungroup() %>%
+        rename(
+            mon1_expir = expirDate,
+            mon1_straddle = straddle,
+            mon1_next = next_straddle,
+            mon1_call = call,
+            mon1_next_call = next_call,
+            mon1_put = put,
+            mon1_next_put = next_put
+        )
+    
+    trades <- mon_legs %>%
+        left_join(fri_legs, by = c("ticker", "tradeDate", "strike")) %>%
+        left_join(month_legs, by = c("ticker", "tradeDate", "strike")) %>%
+        mutate(
+            # 1️⃣ short straddle
+            pnl_short = mon_straddle - mon_next,
+            pnl_short_call = mon_call - mon_next_call,
+            pnl_short_put = mon_put - mon_next_put,
+            
+            # 2️⃣ calendar (next Friday)
+            pnl_cal_fri = (mon_straddle - mon_next) + (fri_next - fri_straddle),
+            pnl_cal_fri_call = (mon_call - mon_next_call) + (fri_next_call - fri_call),
+            pnl_cal_fri_put = (mon_put - mon_next_put) + (fri_next_put - fri_put),
+            
+            # 3️⃣ calendar (1M)
+            pnl_cal_month = (mon_straddle - mon_next) + (mon1_next - mon1_straddle),
+            pnl_cal_month_call = (mon_call - mon_next_call) + (mon1_next_call - mon1_call),
+            pnl_cal_month_put = (mon_put - mon_next_put) + (mon1_next_put - mon1_put)
+        )
+}
+
+# Plotting and other stuff
+{
+    library(tidyr)
+    library(quantmod)
+    
+    # Straddles return
+    trades_straddle <- trades %>%
+        dplyr::select(ticker, tradeDate, strike, starts_with("pnl_")) %>%
+        pivot_longer(
+            cols = starts_with("pnl_"),
+            names_to = "strategy",
+            values_to = "pnl"
+        ) %>% distinct %>% dplyr::filter(strategy %in% c("pnl_short", "pnl_cal_fri", "pnl_cal_month")) %>% group_by(ticker, strategy) %>% 
+        mutate(equity = cumsum(pnl %>% replace_na(0)))
+    
+    trades_straddle %>% ggplot(aes(tradeDate, equity, color=strategy, group=strategy)) + geom_line() + facet_wrap(~ticker) + scale_color_colorblind() 
+    # Sharpe ratios
+    trades_straddle %>% group_by(ticker, strategy) %>% reframe(SR = mean(pnl, na.rm=T) / sd(pnl, na.rm=T) * sqrt(52))
+    # Dollar profit
+    trades_straddle %>% mutate(pnl=pnl*100) %>%  group_by(ticker, strategy) %>% reframe(Mean = mean(pnl, na.rm=T),
+                                                                          Median = median(pnl, na.rm=T),
+                                                                          Std = sd(pnl, na.rm=T),
+                                                                          Max = max(pnl, na.rm=T),
+                                                                          Min = min(pnl, na.rm=T),
+    )    
+    
+    # Adjust pnls by std
+    trades_straddle_adj  <- trades_straddle %>% group_by(ticker, strategy) %>% mutate(pnl_adj = pnl / sd(pnl, na.rm=T), equity_adj = cumsum(pnl_adj %>% replace_na(0)))
+    trades_straddle_adj %>% ggplot(aes(tradeDate, equity_adj, color=strategy, group=strategy)) + geom_line() + facet_wrap(~ticker) + scale_color_colorblind()
+    trades_straddle_adj %>% group_by(strategy) %>% reframe(SR = mean(pnl_adj, na.rm=T) / sd(pnl_adj, na.rm=T) * sqrt(52))
+    
+    # Between tickers correlation
+    # pnl
+    df <- trades_straddle %>% ungroup %>% filter(strategy =="pnl_short") %>% dplyr::select(ticker, tradeDate, pnl) %>% pivot_wider(id_cols = tradeDate, names_from = ticker, values_from = pnl)
+    df %>% dplyr::select(-tradeDate) %>% cor(use = "pairwise.complete.obs")
+    # price returns
+    df <- trades_straddle %>% group_by(ticker) %>%  filter(strategy =="pnl_short") %>% dplyr::select(ticker, tradeDate, strike) %>% mutate(ret = c(0, diff(log(strike)))) %>% pivot_wider(id_cols = tradeDate, names_from = ticker, values_from = ret)
+    df %>% dplyr::select(-tradeDate) %>% cor(use = "pairwise.complete.obs")
+    
+    
+    # Call only
+    trades_call <- trades %>% filter(ticker == "IWM") %>% 
+        dplyr::select(tradeDate, strike, starts_with("pnl_")) %>%
+        pivot_longer(
+            cols = starts_with("pnl_"),
+            names_to = "strategy",
+            values_to = "pnl"
+        ) %>% distinct %>% dplyr::filter(strategy %in% c("pnl_short_call", "pnl_cal_fri_call", "pnl_cal_month_call")) %>% group_by(strategy) %>% 
+        mutate(equity = cumsum(pnl %>% replace_na(0)))
+    
+    trades_call %>% ggplot(aes(tradeDate, equity, color=strategy, group=strategy)) + geom_line() + scale_color_colorblind()
+    trades_call %>% group_by(strategy) %>% reframe(SR = mean(pnl, na.rm=T) / sd(pnl, na.rm=T) * sqrt(52))
+    trades_call %>% mutate(pnl=pnl*100) %>%  group_by(strategy) %>% reframe(Mean = mean(pnl, na.rm=T),
+                                                                                Median = median(pnl, na.rm=T),
+                                                                                Std = sd(pnl, na.rm=T),
+                                                                                Max = max(pnl, na.rm=T),
+                                                                                Min = min(pnl, na.rm=T),
+    )    
+    
+    
+    # Put only
+    trades_put <- trades %>% filter(ticker == "IWM") %>% 
+        dplyr::select(tradeDate, strike, starts_with("pnl_")) %>%
+        pivot_longer(
+            cols = starts_with("pnl_"),
+            names_to = "strategy",
+            values_to = "pnl"
+        ) %>% distinct %>% dplyr::filter(strategy %in% c("pnl_short_put", "pnl_cal_fri_put", "pnl_cal_month_put")) %>% group_by(strategy) %>% 
+        mutate(equity = cumsum(pnl %>% replace_na(0)))
+    
+    trades_put %>% ggplot(aes(tradeDate, equity, color=strategy, group=strategy)) + geom_line() + scale_color_colorblind()
+    trades_put %>% group_by(strategy) %>% reframe(SR = mean(pnl, na.rm=T) / sd(pnl, na.rm=T) * sqrt(52))
+    trades_put %>% mutate(pnl=pnl*100) %>%  group_by(strategy) %>% reframe(Mean = mean(pnl, na.rm=T),
+                                                                            Median = median(pnl, na.rm=T),
+                                                                            Std = sd(pnl, na.rm=T),
+                                                                            Max = max(pnl, na.rm=T),
+                                                                            Min = min(pnl, na.rm=T),
+    )   
+    
+    getSymbols("^VIX")
+    getSymbols("^VIX3M")
+    VIX <- VIX %>% as.data.frame() %>% mutate(tradeDate = date(VIX)) %>% dplyr::select(tradeDate, VIX.Adjusted)
+    VIX3M <- VIX3M %>% as.data.frame() %>% mutate(tradeDate = date(VIX3M)) %>% dplyr::select(tradeDate, VIX3M.Adjusted)
+    VIX <- VIX %>% arrange(tradeDate) %>% mutate(VIX_zscore = runZscore(VIX.Adjusted %>% log %>% na.locf(na.rm=F), 252))
+    trade_vix <- trades_straddle %>% filter(ticker == "IWM") %>% left_join(VIX)  %>% left_join(VIX3M)
+    
+    # Per-trade Dollar profits
+    trade_vix %>% mutate(pnl=pnl*100) %>%  group_by(strategy) %>% reframe(Mean = mean(pnl, na.rm=T),
+                                                 Median = median(pnl, na.rm=T),
+                                                 Std = sd(pnl, na.rm=T),
+                                                 Max = max(pnl, na.rm=T),
+                                                 Min = min(pnl, na.rm=T),
+                                                 )
+    
+    trade_vix %>% mutate(pnl=pnl*100) %>% ggplot(aes(x=pnl, fill=strategy)) + geom_density(alpha=0.5, color="black") + scale_fill_colorblind()
+    
+    # Contango filter?
+    trade_vix <- trade_vix %>% mutate(contango = (VIX.Adjusted-VIX3M.Adjusted)<0) %>% 
+        group_by(strategy, contango) %>%  mutate(equity = cumsum(pnl %>% replace_na(0)))
+    trade_vix %>% ggplot(aes(tradeDate, equity, color=strategy)) + geom_line() + facet_wrap(~contango) + scale_color_colorblind()
+    
+    # VIX zscore filter?
+    trade_vix <- trade_vix %>% mutate(high_vix = VIX_zscore > 2) %>% 
+        group_by(strategy, high_vix) %>%  mutate(equity = cumsum(pnl %>% replace_na(0)))
+    trade_vix %>% ggplot(aes(tradeDate, equity, color=strategy)) + geom_line() + facet_wrap(~high_vix) + scale_color_colorblind()
+    
+}
+
+
+{
+    # Refer to Weekend.R to get the "straddle" variable
+    straddles %>% filter(ticker %in% c("SPY", "QQQ", "IWM") & dte == 4) %>% group_by(ticker) %>% 
+        mutate(PnL = cumsum(-profit*100)) %>% ggplot(aes(tradeDate, PnL, color=ticker)) + 
+        geom_line(linewidth=2) + geom_point(color="black", size=0.2) + xlab("Date") + ylab("Dollars")
+    straddles %>% filter(ticker %in% c("SPY", "QQQ", "IWM") & dte == 4) %>% group_by(ticker, dte) %>% 
+        mutate(PnL = cumsum(-profit_pct)) %>% ggplot(aes(tradeDate, PnL, color=ticker)) + 
+        geom_line(linewidth=2) + geom_point(color="black", size=0.2) + xlab("Date") + ylab("")
+    straddles %>% filter(ticker %in% c("SPY", "QQQ", "IWM") & dte %in% c(4, 6, 8)) %>% group_by(ticker, dte) %>% mutate(dte = dte-1) %>% 
+        mutate(PnL = cumsum(-profit_pct)) %>% ggplot(aes(tradeDate, PnL, color=ticker)) + geom_line(linewidth=2) + 
+        geom_point(color="black", size=0.2) + facet_wrap(~dte) + xlab("Date") + ylab("")
+    straddles %>% filter(ticker %in% c("SPY", "QQQ", "IWM")) %>% ggplot(aes(x=-profit*100, fill=ticker)) + geom_boxplot(color="black", alpha=0.5) + theme(legend.position = "right") + xlab("Short Straddle Profit")
+    straddles_total %>% filter(ticker %in% c("SPY", "QQQ", "IWM")) %>% 
+        reframe(profit_pct=mean(profit_pct, na.rm=T)) %>% group_by(ticker, wd) %>% mutate(PnL = cumsum(-profit_pct)) %>% 
+        ggplot(aes(tradeDate, PnL, color=ticker)) + geom_line(linewidth=2) + geom_point(color="black", size=0.2) + facet_wrap( ~wd)+ xlab("Date") + ylab("")
+    straddles %>% filter(ticker %in% c("GLD", "FXI", "TLT", "USO") ) %>% group_by(tradeDate, ticker, wd) %>%  reframe(profit_pct=mean(profit_pct, na.rm=T)) %>% group_by(ticker) %>% 
+        mutate(PnL = cumsum(-profit_pct)) %>% ggplot(aes(tradeDate, PnL, color=ticker)) + 
+        geom_line(linewidth=2) + geom_point(color="black", size=0.2) + xlab("Date") + ylab("")
+}

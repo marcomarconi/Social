@@ -1,0 +1,159 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+library(dplyr)
+library(readr)
+library(stringr)
+library(purrr)
+library(lubridate)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(quantmod)
+
+# folder containing files
+path <- "/home/marco/trading/HistoricalData/Barchart/Futures/VIX"
+
+files <- list.files(path, pattern = "^vi.*csv$", full.names = TRUE)
+
+# month code mapping
+month_map <- c(
+    f = 1, g = 2, h = 3, j = 4,
+    k = 5, m = 6, n = 7, q = 8,
+    u = 9, v = 10, x = 11, z = 12
+)
+
+read_contract <- function(file){
+    
+    fname <- basename(file)
+    
+    month_code <- str_sub(fname, 3, 3)
+    year_code  <- str_sub(fname, 4, 5)
+    
+    contract_month <- month_map[[month_code]]
+    contract_year  <- 2000 + as.numeric(year_code)
+    
+    contract_date <- ymd(sprintf("%d-%02d-01",
+                                 contract_year,
+                                 contract_month))
+    
+    read_csv(file, show_col_types = FALSE) %>%
+        select(Time, Last) %>%
+        mutate(
+            date = parse_date_time(Time, orders = c("mdy", "ymd")),
+            date = as.Date(date),
+            price = Last,
+            contract = contract_date
+            ) %>% 
+        arrange(date) %>% 
+        mutate(return = c(0, diff(log(Last)))) %>% 
+        select(date, contract, price, return)
+}
+
+```
+
+```{r}
+
+# read all contracts
+df <- map_dfr(files, read_contract)
+
+df_ranked <- df %>%
+    mutate(ttm = as.numeric(contract - date)) %>%
+    #filter(ttm >= 0) %>%
+    group_by(date) %>%
+    arrange(ttm) %>%
+    mutate(rank = row_number()) %>%
+    filter(rank <= 3)
+
+vi_df <- df_ranked %>%
+    select(date, rank, return) %>%
+    pivot_wider(
+        names_from = rank,
+        values_from = return,
+        names_prefix = "contract_"
+    ) %>%
+    arrange(date) %>% ungroup
+
+getSymbols("^VIX1D") 
+getSymbols("^VIX") 
+getSymbols("^VIX3M") 
+VIX1D <- xts_to_df(VIX1D) %>% dplyr::select(date, VIX1D.Adjusted) %>% rename(VIX1D=VIX1D.Adjusted)
+VIX <-  xts_to_df(VIX) %>% dplyr::select(date, VIX.Adjusted) %>% rename(VIX=VIX.Adjusted)
+VIX3M <-  xts_to_df(VIX3M) %>% dplyr::select(date, VIX3M.Adjusted) %>% rename(VIX3M=VIX3M.Adjusted)
+
+final_df <- Reduce(function(...) inner_join(..., by = "date"), list(vi_df, VIX1D, VIX, VIX3M)) 
+
+
+
+```
+
+```{r}
+final_df <- final_df %>% mutate(pred = lag(VIX1D), 
+                                contango = VIX - VIX3M,
+                                ret_naive_1 = -contract_1,
+                                ret_naive_2 = -contract_2,
+                                ret_naive_3 = -contract_3,
+                                ret1 = case_when(pred <= 10~ contract_1, pred >= 15~ -contract_1,TRUE~0),
+                                ret2 = case_when(pred <= 10~ contract_2, pred >= 15~ -contract_2,TRUE~0),
+                                ret3 = case_when(pred <= 10~ contract_3, pred >= 15~ -contract_3,TRUE~0),
+                                eq_naive_1 = cumsum(replace_na(ret_naive_1, 0)),
+                                eq_naive_2 = cumsum(replace_na(ret_naive_2, 0)),
+                                eq_naive_3 = cumsum(replace_na(ret_naive_3, 0)),
+                                eq1 = cumsum(replace_na(ret1, 0)),
+                                eq2 = cumsum(replace_na(ret2, 0)),
+                                eq3 = cumsum(replace_na(ret3, 0))
+                                ) 
+
+final_df %>% summarize(
+    M1 = mean(ret1, na.rm=T), S1 = sd(ret1, na.rm=T)/sqrt(n()),
+    M2 = mean(ret2, na.rm=T), S2 = sd(ret2, na.rm=T)/sqrt(n()),
+    M3 = mean(ret3, na.rm=T), S3 = sd(ret3, na.rm=T)/sqrt(n())
+    )
+
+final_df %>% dplyr::select(date, eq1, eq2, eq3) %>% matplot2
+
+final_df %>% dplyr::select(date, eq_naive_1, eq_naive_2, eq_naive_3) %>% matplot2
+
+
+final_df %>% dplyr::select(date, ret1, ret2, ret3)%>% na.omit %>% pivot_longer(cols = -date, names_to = "contract", values_to = "ret") %>%  group_by(contract) %>% reframe(
+    SR = mean(ret, na.rm=T) / sd(ret, na.rm=T) * sqrt(252)
+    )
+final_df %>% dplyr::select(date, ret_naive_1, ret_naive_2, ret_naive_3)%>% na.omit %>% pivot_longer(cols = -date, names_to = "contract", values_to = "ret") %>%  group_by(contract) %>% reframe(
+    SR = mean(ret, na.rm=T) / sd(ret, na.rm=T) * sqrt(252)
+    )
+
+
+```
+
+```{r}
+final_n <- final_df %>%
+    mutate(pred_n = factor(ifelse(pred<20, round(pred/2)*2, 20)))
+final_n <- final_n %>% dplyr::select(date, contract_1, pred_n) %>% 
+    pivot_longer(-c(date, pred_n)) %>% group_by(pred_n) %>% mutate(eq = cumsum(replace_na(value, 0)))
+final_n %>% ggplot(aes(date, eq, color=pred_n)) + geom_line(size=2) + geom_hline(yintercept = 0)
+
+```
+
+Only entering trade when VIX term structure in contango (we only consider front contract)
+```{r}
+final_df <- final_df  %>% arrange(date)%>% mutate(ret1_simple = in_trade,
+                                ret1_contango = ifelse(contango<0, ret1, 0),
+                                eq1_simple = cumsum(ret1_simple %>% replace_na(0)),
+                                eq1_contango = cumsum(ret1_contango %>% replace_na(0))
+                                )
+
+final_df %>% dplyr::select(date, eq1_simple, eq1_contango) %>% filter(year(date)>2022) %>% 
+     pivot_longer(cols = -date, names_to = "contract", values_to = "eq") %>% 
+     ggplot(aes(date)) + geom_line(aes(y=eq, color=contract), size=2)
+
+# Average profit per trade (should be higher than spread cost). I get 1.3% profit and 0.5% cost
+final_trade <- final_df %>% mutate(in_trade = case_when(pred <= 10 & contango<0 ~ "long", pred >= 15 & contango<0~ "short", TRUE~NA))
+a<- rle(!is.na(final_trade$in_trade))
+final_trade$rle <- rep(a$value, a$length)
+final_trade %>% group_by(rle) %>% reframe(M = mean(ret1, na.rm=T), C = mean(0.08 / VIX))*100
+```
+

@@ -1,0 +1,91 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+# Load and plot
+library(quantmod)
+library(tidyverse)
+library(ggthemes)
+GLD <- getSymbols("GLD",env=NULL ) %>% as.data.frame() 
+SPY <- getSymbols("SPY",env=NULL ) %>% as.data.frame() 
+VIX <- getSymbols("^VIX",env=NULL ) %>% as.data.frame() 
+VIX3M <- getSymbols("^VIX3M",env=NULL ) %>% as.data.frame() 
+GLD <- GLD %>% rownames_to_column("date") %>% dplyr::select(date, GLD.Adjusted)
+SPY <- SPY %>% rownames_to_column("date") %>% dplyr::select(date, SPY.Adjusted)
+VIX <- VIX %>% rownames_to_column("date") %>% dplyr::select(date, VIX.Adjusted)
+VIX3M <- VIX3M %>% rownames_to_column("date") %>% dplyr::select(date, VIX3M.Adjusted)
+term_structure <- full_join(VIX, VIX3M) %>% mutate(term_structure = VIX.Adjusted / VIX3M.Adjusted, by="date") %>% dplyr::select(date, term_structure)
+df <- Reduce(function(...) full_join(..., by = "date"), list(GLD, SPY, VIX, VIX3M, term_structure)) %>% 
+    pivot_longer(cols = -date, names_to = "ticker") %>% 
+    mutate(ticker=sub(".Adjusted", "", ticker))
+df %>% ggplot(aes(x=date,y=value,color=ticker,group=ticker)) + geom_line() + scale_color_colorblind()
+```
+```{r}
+# building the data frames
+df_lag <- df %>% mutate(wday = lubridate::wday(date, label = TRUE)) %>% group_by(ticker) %>% 
+    mutate(ret = c(0, diff(log(value)))) %>% ungroup
+df_lag <- df_lag %>% group_by(ticker) %>% mutate(up = lag(ret) > 0) %>% ungroup
+df_gld <- df_lag %>% dplyr::filter(ticker == "GLD") %>% dplyr::select(date, up) %>% rename(GLDup=up)
+df_spy <- df_lag %>% dplyr::filter(ticker == "SPY") %>% dplyr::select(date, up) %>% rename(SPYup=up)
+df_vix <- df_lag %>% dplyr::filter(ticker == "VIX") %>% dplyr::select(date, up) %>% rename(VIXup=up)
+df_vix3m <- df_lag %>% dplyr::filter(ticker == "VIX3M") %>% dplyr::select(date, up) %>% rename(VIX3Mup=up)
+df_term <- df_lag %>% dplyr::filter(ticker == "term_structure") %>% dplyr::select(date, up) %>% rename(termUP=up)
+df_full <- full_join(df_lag, df_spy, by="date") %>% full_join(., df_vix, by="date") %>% full_join(., df_term, by="date") %>% full_join(., df_gld, by="date") %>% mutate(date=as.Date(date)) %>% arrange(date)
+```
+
+
+
+```{r}
+# Average GLD move, and conditional on previous day and contango
+df_full %>% dplyr::filter(ticker == "GLD") %>% group_by(wday) %>% 
+    reframe(M = mean(ret*100, na.rm=T), S = sd(ret*100, na.rm=T)/sqrt(n())  )  %>% 
+    ggplot(aes(x=wday, y=M, ymin=M-S, ymax=M+S)) + geom_bar(stat="identity", position="dodge", width = 0.5) + geom_errorbar(width=0.25, position = position_dodge(0.5)) + ggtitle("Average daily move")
+df_full %>% dplyr::filter(ticker == "GLD") %>% group_by(wday, GLDup) %>% 
+    reframe(M = mean(ret*100, na.rm=T), S = sd(ret*100, na.rm=T)/sqrt(n())  )  %>% 
+    ggplot(aes(x=wday, y=M, ymin=M-S, ymax=M+S, fill=GLDup)) + geom_bar(stat="identity", position="dodge", width = 0.5) + geom_errorbar(width=0.25, position = position_dodge(0.5)) + ggtitle("Daily move if previous day up")
+df_full %>% dplyr::filter(ticker == "GLD") %>% group_by(wday, SPYup) %>% 
+    reframe(M = mean(ret*100, na.rm=T), S = sd(ret*100, na.rm=T)/sqrt(n())  )  %>% 
+    ggplot(aes(x=wday, y=M, ymin=M-S, ymax=M+S, fill=SPYup)) + geom_bar(stat="identity", position="dodge", width = 0.5) + geom_errorbar(width=0.25, position = position_dodge(0.5)) + ggtitle("Daily move if SPY previous day up")
+df_full %>% dplyr::filter(ticker == "GLD") %>% group_by(wday, VIXup) %>% 
+    reframe(M = mean(ret*100, na.rm=T), S = sd(ret*100, na.rm=T)/sqrt(n())  )  %>% 
+    ggplot(aes(x=wday, y=M, ymin=M-S, ymax=M+S, fill=VIXup)) + geom_bar(stat="identity", position="dodge", width = 0.5) + geom_errorbar(width=0.25, position = position_dodge(0.5))+ ggtitle("Daily move if VIX previous day up")
+df_full %>% dplyr::filter(ticker == "GLD") %>% group_by(wday, termUP) %>% 
+    reframe(M = mean(ret*100, na.rm=T), S = sd(ret*100, na.rm=T)/sqrt(n())  )  %>% 
+    ggplot(aes(x=wday, y=M, ymin=M-S, ymax=M+S, fill=termUP)) + geom_bar(stat="identity", position="dodge", width = 0.5) + geom_errorbar(width=0.25, position = position_dodge(0.5))+ ggtitle("Daily move if term structure UP")
+      
+```
+
+
+```{r}
+# Some Statistic
+df_full %>%  dplyr::filter(wday=="Fri" & ticker == "GLD") %>% 
+    mutate(naive_pnl = ret * 1, 
+           adv_pnl = if_else(termUP, 0.5*ret, 1.5*ret)) %>% 
+    summarize(
+        MeanNaive = mean(naive_pnl, na.rm=T),
+        SdNaive = sd(naive_pnl, na.rm=T),
+        SdAnnNaive = sd(naive_pnl, na.rm=T)*sqrt(52),
+        SRNaive = mean(naive_pnl, na.rm=T)/sd(naive_pnl, na.rm=T)*sqrt(52),
+        MeanAdv = mean(adv_pnl, na.rm=T),
+        SdAdv = sd(adv_pnl, na.rm=T),
+        SdAnnAdv = sd(adv_pnl, na.rm=T)*sqrt(52),
+        SRAdv = mean(adv_pnl, na.rm=T)/sd(adv_pnl, na.rm=T)*sqrt(52)
+
+    ) %>% t
+```
+
+```{r}
+# Equity backtest
+df_bt <- df_full %>% na.omit %>% dplyr::filter(wday=="Fri" & ticker == "GLD") %>% mutate(naive_pnl = ret * 1, adv_pnl = if_else(GLDup, 0.5*ret, 1.5*ret)) %>% na.omit %>% mutate(naive_eq = cumsum(naive_pnl), adv_eq = cumsum(adv_pnl)) 
+df_bt %>% ggplot(aes(date)) + geom_line(aes(y=naive_eq), color="black") + geom_line(aes(y=adv_eq), color="blue")
+mean(df_bt$naive_pnl) / sd(df_bt$naive_pnl) * sqrt(52)
+mean(df_bt$adv_pnl) / sd(df_bt$adv_pnl) * sqrt(52)
+```
+
+
